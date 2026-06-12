@@ -1,14 +1,19 @@
 package com.firstdiff.controller;
 
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
 import com.firstdiff.dto.IssueFilters;
 import com.firstdiff.dto.RepoFilters;
 import com.firstdiff.service.HealthScoreService;
 import com.firstdiff.service.IssueService;
 import com.firstdiff.service.RepoService;
-import org.springframework.web.bind.annotation.*;
-
-import java.util.List;
-import java.util.Map;
 
 @RestController
 @RequestMapping("/api")
@@ -40,14 +45,19 @@ public class ApiController {
             @RequestParam(defaultValue = "0") Integer maxAgeDays,
             @RequestParam(defaultValue = "0") Integer createdWithinDays,
             @RequestParam(defaultValue = "updated") String sort,
+        /*     @RequestParam(defaultValue = "desc") String order,
+            @RequestParam(defaultValue = "20") int perLabel) {
+        */
             @RequestParam(defaultValue = "desc") String order,
             @RequestParam(defaultValue = "20") int perLabel) {
+
+
         return issues.search(new IssueFilters(labels, language, unassignedOnly, maxComments,
                 minReactions, maxAgeDays, createdWithinDays, sort, order, perLabel));
     }
 
     /**
-     * GET /api/repos
+     * GET /api/re
      * Example (small, genuinely beginner-welcoming Python projects, small -> big):
      *   /api/repos?topics=good-first-issue&topics=first-timers-only&language=Python
      *     &minStars=50&maxStars=2000&minGoodFirstIssues=3&pushedWithinDays=30
