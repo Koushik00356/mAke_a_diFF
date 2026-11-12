@@ -2,65 +2,77 @@ package com.firstdiff.service;
 
 import com.firstdiff.dto.RepoFilters;
 import com.firstdiff.github.GitHubClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 @Service
 public class RepoService {
 
+    private static final Logger log = LoggerFactory.getLogger(RepoService.class);
     private static final int MAX_TOPICS = 4;
+
     private final GitHubClient github;
-    private final ExecutorService vt = Executors.newVirtualThreadPerTaskExecutor();
 
     public RepoService(GitHubClient github) {
         this.github = github;
     }
 
-    @Cacheable(value = "search", key = "'repos:' + #f.toString()")
+    /** Partial results (some topic searches failed) are returned but never cached. */
+    @Cacheable(value = "search", key = "'repos:' + #f.toString()", unless = "#result['partial'] == true")
     public Map<String, Object> search(RepoFilters f) {
-        List<String> topics = f.topics().stream().limit(MAX_TOPICS).toList();
+        log.info("cache MISS (search) -> calling GitHub: {}", f);
 
-        List<CompletableFuture<List<Map<String, Object>>>> futures = topics.stream()
-                .map(topic -> CompletableFuture.supplyAsync(() -> fetchForTopic(topic, f), vt)
-                        .exceptionally(ex -> List.of()))
+        List<String> topics = f.topics().stream()
+                .map(t -> t.trim().toLowerCase().replaceAll("[^a-z0-9-]", "-"))
+                .filter(t -> !t.isEmpty())
+                .distinct()
+                .limit(MAX_TOPICS)
                 .toList();
+        if (topics.isEmpty()) topics = List.of("good-first-issue");
 
-        CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
-
-        Map<Object, Map<String, Object>> merged = new LinkedHashMap<>();
-        for (var fut : futures) {
-            for (Map<String, Object> repo : fut.join()) {
-                merged.putIfAbsent(repo.get("id"), repo);
-            }
-        }
-
-        List<Map<String, Object>> items = new ArrayList<>(merged.values());
+        FanOut.Result r = FanOut.run(topics, topic -> fetchForTopic(topic, f));
+        List<Map<String, Object>> items = r.items();
 
         if (f.pushedWithinDays() != null && f.pushedWithinDays() > 0) {
             Instant cutoff = Instant.now().minus(f.pushedWithinDays(), ChronoUnit.DAYS);
-            items.removeIf(r -> Instant.parse((String) r.get("pushed_at")).isBefore(cutoff));
+            items.removeIf(x -> Instant.parse((String) x.get("pushed_at")).isBefore(cutoff));
         }
 
         sortItems(items, f.sort(), f.order());
 
-        return Map.of(
-                "total", items.size(),
-                "topics_searched", topics,
-                "items", items
-        );
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("total", items.size());
+        out.put("github_matches", r.matched()); // summed per topic, before de-duplication
+        out.put("topics_searched", topics);
+        out.put("topics_failed", r.failed());
+        out.put("partial", !r.failed().isEmpty());
+        out.put("items", items);
+        return out;
     }
 
-    private List<Map<String, Object>> fetchForTopic(String topic, RepoFilters f) {
-        StringBuilder q = new StringBuilder("topic:").append(topic).append(" archived:false");
+    /** Single repo detail, for the issue card's expanded view. */
+    @Cacheable(value = "health", key = "'repo:' + #owner + '/' + #repo")
+    public Map<String, Object> detail(String owner, String repo) {
+        log.info("cache MISS (repo) -> calling GitHub: {}/{}", owner, repo);
+        return github.get(u -> u.path("/repos/{o}/{r}").build(owner, repo));
+    }
+
+    private Map<String, Object> fetchForTopic(String topic, RepoFilters f) {
+        StringBuilder q = new StringBuilder();
+        if (f.keyword() != null && !f.keyword().isBlank())
+            q.append(f.keyword().trim()).append(" in:name,description ");
+        q.append("topic:").append(topic).append(" archived:false");
         if (f.language() != null && !f.language().isBlank())
-            q.append(" language:\"").append(f.language()).append('"');
+            q.append(" language:\"").append(f.language().replace("\"", "").trim()).append('"');
 
         // project size: stars range, supports small -> big browsing
         int min = f.minStars() == null ? 0 : f.minStars();
@@ -69,36 +81,38 @@ public class RepoService {
         else if (min > 0) q.append(" stars:>=").append(min);
         else if (max > 0) q.append(" stars:<=").append(max);
 
-        // these two qualifiers are the gems for this use case:
-        // they find repos that ACTUALLY have open beginner issues right now
+        // these two qualifiers find repos that ACTUALLY have open beginner issues right now
         if (f.minGoodFirstIssues() != null && f.minGoodFirstIssues() > 0)
             q.append(" good-first-issues:>=").append(f.minGoodFirstIssues());
         if (f.minHelpWantedIssues() != null && f.minHelpWantedIssues() > 0)
             q.append(" help-wanted-issues:>=").append(f.minHelpWantedIssues());
 
         if (f.license() != null && !f.license().isBlank())
-            q.append(" license:").append(f.license());
+            q.append(" license:").append(f.license().trim().replaceAll("\\s+", "-"));
         if (f.excludeForks()) q.append(" fork:false");
 
         String query = q.toString();
-        Map<String, Object> body = github.get(u -> u.path("/search/repositories")
-                .queryParam("q", query)
-                .queryParam("sort", f.sort())
-                .queryParam("order", f.order())
+        return github.get(u -> u.path("/search/repositories")
+                .queryParam("q", "{q}")
+                .queryParam("sort", apiSort(f.sort()))
+                .queryParam("order", "asc".equals(f.order()) ? "asc" : "desc")
                 .queryParam("per_page", 25)
-                .build());
+                .build(query));
+    }
 
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> items = (List<Map<String, Object>>) body.getOrDefault("items", List.of());
-        return items;
+    private static String apiSort(String sort) {
+        return switch (sort == null ? "" : sort) {
+            case "updated", "forks", "help-wanted-issues" -> sort;
+            default -> "stars";
+        };
     }
 
     private static void sortItems(List<Map<String, Object>> items, String sort, String order) {
-        Comparator<Map<String, Object>> cmp = switch (sort) {
-            case "updated" -> Comparator.comparing(r -> Instant.parse((String) r.get("pushed_at")));
-            case "forks" -> Comparator.comparingInt(r -> ((Number) r.getOrDefault("forks_count", 0)).intValue());
-            case "help-wanted-issues" -> Comparator.comparingInt(r -> ((Number) r.getOrDefault("open_issues_count", 0)).intValue());
-            default -> Comparator.comparingInt(r -> ((Number) r.getOrDefault("stargazers_count", 0)).intValue());
+        Comparator<Map<String, Object>> cmp = switch (sort == null ? "" : sort) {
+            case "updated" -> Comparator.comparing(x -> Instant.parse((String) x.get("pushed_at")));
+            case "forks" -> Comparator.comparingInt(x -> ((Number) x.getOrDefault("forks_count", 0)).intValue());
+            case "help-wanted-issues" -> Comparator.comparingInt(x -> ((Number) x.getOrDefault("open_issues_count", 0)).intValue());
+            default -> Comparator.comparingInt(x -> ((Number) x.getOrDefault("stargazers_count", 0)).intValue());
         };
         if (!"asc".equals(order)) cmp = cmp.reversed();
         items.sort(cmp);

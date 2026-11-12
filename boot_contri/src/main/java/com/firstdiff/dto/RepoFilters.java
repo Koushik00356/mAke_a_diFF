@@ -13,6 +13,7 @@ public record RepoFilters(
         Integer pushedWithinDays,    // only repos pushed to within N days (0 = any)
         String license,              // e.g. mit, apache-2.0 (optional)
         boolean excludeForks,        // skip forked repos
+        String keyword,              // free text, matched in name + description
         String sort,                 // stars | updated | forks | help-wanted-issues
         String order                 // asc (small -> big) | desc
 ) {}

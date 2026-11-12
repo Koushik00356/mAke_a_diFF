@@ -2,49 +2,46 @@ package com.firstdiff.service;
 
 import com.firstdiff.dto.IssueFilters;
 import com.firstdiff.github.GitHubClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 @Service
 public class IssueService {
 
+    private static final Logger log = LoggerFactory.getLogger(IssueService.class);
     private static final int MAX_LABELS = 6;
+
     private final GitHubClient github;
-    // virtual threads: thousands of cheap blocking calls, perfect for API fan-out
-    private final ExecutorService vt = Executors.newVirtualThreadPerTaskExecutor();
 
     public IssueService(GitHubClient github) {
         this.github = github;
     }
 
-    @Cacheable(value = "search", key = "'issues:' + #f.toString()")
+    /** Partial results (some label searches failed) are returned but never cached. */
+    @Cacheable(value = "search", key = "'issues:' + #f.toString()", unless = "#result['partial'] == true")
     public Map<String, Object> search(IssueFilters f) {
-        List<String> labels = f.labels().stream().limit(MAX_LABELS).toList();
+        // this body only runs on a cache miss: a repeated search logs nothing here
+        log.info("cache MISS (search) -> calling GitHub: {}", f);
 
-        // one GitHub search per label, in parallel
-        List<CompletableFuture<List<Map<String, Object>>>> futures = labels.stream()
-                .map(label -> CompletableFuture.supplyAsync(() -> fetchForLabel(label, f), vt)
-                        .exceptionally(ex -> List.of())) // a failed label search degrades, not breaks
+        List<String> labels = f.labels().stream()
+                .map(l -> l.replace("\"", "").trim())
+                .filter(l -> !l.isEmpty())
+                .distinct()
+                .limit(MAX_LABELS)
                 .toList();
+        if (labels.isEmpty()) labels = List.of("good first issue");
 
-        CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
-
-        // merge + dedupe by issue id
-        Map<Object, Map<String, Object>> merged = new LinkedHashMap<>();
-        for (var fut : futures) {
-            for (Map<String, Object> issue : fut.join()) {
-                merged.putIfAbsent(issue.get("id"), issue);
-            }
-        }
-
-        List<Map<String, Object>> items = new ArrayList<>(merged.values());
+        FanOut.Result r = FanOut.run(labels, label -> fetchForLabel(label, f));
+        List<Map<String, Object>> items = r.items();
 
         // post-filters GitHub's query language can't express precisely
         if (f.maxAgeDays() != null && f.maxAgeDays() > 0) {
@@ -57,17 +54,23 @@ public class IssueService {
 
         sortItems(items, f.sort(), f.order());
 
-        return Map.of(
-                "total", items.size(),
-                "labels_searched", labels,
-                "items", items
-        );
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("total", items.size());
+        out.put("github_matches", r.matched()); // summed per label, before de-duplication
+        out.put("labels_searched", labels);
+        out.put("labels_failed", r.failed());
+        out.put("partial", !r.failed().isEmpty());
+        out.put("items", items);
+        return out;
     }
 
-    private List<Map<String, Object>> fetchForLabel(String label, IssueFilters f) {
-        StringBuilder q = new StringBuilder("label:\"").append(label).append("\" state:open is:issue");
+    private Map<String, Object> fetchForLabel(String label, IssueFilters f) {
+        StringBuilder q = new StringBuilder();
+        if (f.keyword() != null && !f.keyword().isBlank())
+            q.append(f.keyword().trim()).append(" in:title,body ");
+        q.append("label:\"").append(label).append("\" state:open is:issue");
         if (f.language() != null && !f.language().isBlank())
-            q.append(" language:\"").append(f.language()).append('"');
+            q.append(" language:\"").append(f.language().replace("\"", "").trim()).append('"');
         if (f.unassignedOnly()) q.append(" no:assignee");
         if (f.maxComments() != null && f.maxComments() >= 0)
             q.append(" comments:<=").append(f.maxComments());
@@ -77,23 +80,19 @@ public class IssueService {
                             .toString().substring(0, 10));
 
         String query = q.toString();
-        Map<String, Object> body = github.get(u -> u.path("/search/issues")
-                .queryParam("q", query)
-                .queryParam("sort", apiSort(f.sort()))
-                .queryParam("order", f.order())
+        return github.get(u -> u.path("/search/issues")
+                .queryParam("q", "{q}")
+                .queryParam("sort", "{sort}")
+                .queryParam("order", "asc".equals(f.order()) ? "asc" : "desc")
                 .queryParam("per_page", Math.min(Math.max(f.perLabel(), 1), 50))
-                .build());
-
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> items = (List<Map<String, Object>>) body.getOrDefault("items", List.of());
-        return items;
+                .build(query, apiSort(f.sort())));
     }
 
     private static String apiSort(String sort) {
         // GitHub's API accepts these sort values; "reactions" needs the long form
-        return switch (sort) {
+        return switch (sort == null ? "" : sort) {
             case "reactions" -> "reactions-+1";
-            case "created", "comments", "updated" -> sort;
+            case "created", "comments" -> sort;
             default -> "updated";
         };
     }
@@ -105,7 +104,7 @@ public class IssueService {
     }
 
     private static void sortItems(List<Map<String, Object>> items, String sort, String order) {
-        Comparator<Map<String, Object>> cmp = switch (sort) {
+        Comparator<Map<String, Object>> cmp = switch (sort == null ? "" : sort) {
             case "created" -> Comparator.comparing(i -> Instant.parse((String) i.get("created_at")));
             case "comments" -> Comparator.comparingInt(i -> ((Number) i.getOrDefault("comments", 0)).intValue());
             case "reactions" -> Comparator.comparingInt(IssueService::reactionCount);

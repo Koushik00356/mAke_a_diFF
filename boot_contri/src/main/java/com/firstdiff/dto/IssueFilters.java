@@ -11,6 +11,7 @@ public record IssueFilters(
         Integer minReactions,       // community-validated issues
         Integer maxAgeDays,         // only issues updated within N days (0 = any)
         Integer createdWithinDays,  // only issues opened within N days (0 = any)
+        String keyword,             // free text, matched in title + body
         String sort,                // updated | created | comments | reactions
         String order,               // asc | desc
         int perLabel                // results fetched per label (1-50)

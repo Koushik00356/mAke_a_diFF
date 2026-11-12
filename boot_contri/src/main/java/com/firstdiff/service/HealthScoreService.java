@@ -23,6 +23,9 @@ import java.util.Map;
 @Service
 public class HealthScoreService {
 
+    private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(HealthScoreService.class);
+
     private final GitHubClient github;
 
     public HealthScoreService(GitHubClient github) {
@@ -31,6 +34,7 @@ public class HealthScoreService {
 
     @Cacheable(value = "health", key = "#owner + '/' + #repo")
     public Map<String, Object> score(String owner, String repo) {
+        log.info("cache MISS (health) -> calling GitHub: {}/{}", owner, repo);
         Map<String, Object> repoData = github.get(u -> u.path("/repos/{o}/{r}").build(owner, repo));
 
         List<Map<String, Object>> prs = github.getList(u -> u.path("/repos/{o}/{r}/pulls")
@@ -62,7 +66,7 @@ public class HealthScoreService {
                 Instant.parse((String) repoData.get("pushed_at")), Instant.now()).toDays();
 
         // 0-100 composite: 40% merge rate, 40% speed, 20% recency
-        double speedScore = medianCloseHours <= 0 ? 0.5
+        double speedScore = medianCloseHours < 0 ? 0.5 // no closed PRs to judge by
                 : Math.max(0, Math.min(1, 1.0 - (medianCloseHours / (14.0 * 24)))); // 2 weeks -> 0
         double recencyScore = Math.max(0, Math.min(1, 1.0 - (daysSincePush / 90.0))); // 90d -> 0
         int composite = (int) Math.round(100 * (0.4 * mergeRate + 0.4 * speedScore + 0.2 * recencyScore));

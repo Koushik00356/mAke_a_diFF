@@ -15,9 +15,15 @@ import com.firstdiff.service.HealthScoreService;
 import com.firstdiff.service.IssueService;
 import com.firstdiff.service.RepoService;
 
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+
 @RestController
 @RequestMapping("/api")
 public class ApiController {
+
+    /** GitHub owner / repo name characters - keeps path variables from reshaping the upstream URL. */
+    private static final String SLUG = "^[A-Za-z0-9._-]{1,100}$";
 
     private final IssueService issues;
     private final RepoService repos;
@@ -33,7 +39,7 @@ public class ApiController {
      * GET /api/issues
      * Example:
      *   /api/issues?labels=good first issue&labels=help wanted&language=Python
-     *     &unassignedOnly=true&maxComments=0&maxAgeDays=30&sort=updated&order=desc&perLabel=20
+     *     &unassignedOnly=true&maxComments=0&maxAgeDays=30&keyword=docs&sort=updated&order=desc&perLabel=20
      */
     @GetMapping("/issues")
     public Map<String, Object> searchIssues(
@@ -44,20 +50,16 @@ public class ApiController {
             @RequestParam(required = false) Integer minReactions,
             @RequestParam(defaultValue = "0") Integer maxAgeDays,
             @RequestParam(defaultValue = "0") Integer createdWithinDays,
+            @RequestParam(required = false) @Size(max = 120) String keyword,
             @RequestParam(defaultValue = "updated") String sort,
-        /*     @RequestParam(defaultValue = "desc") String order,
-            @RequestParam(defaultValue = "20") int perLabel) {
-        */
             @RequestParam(defaultValue = "desc") String order,
             @RequestParam(defaultValue = "20") int perLabel) {
-
-
         return issues.search(new IssueFilters(labels, language, unassignedOnly, maxComments,
-                minReactions, maxAgeDays, createdWithinDays, sort, order, perLabel));
+                minReactions, maxAgeDays, createdWithinDays, keyword, sort, order, perLabel));
     }
 
     /**
-     * GET /api/re
+     * GET /api/repos
      * Example (small, genuinely beginner-welcoming Python projects, small -> big):
      *   /api/repos?topics=good-first-issue&topics=first-timers-only&language=Python
      *     &minStars=50&maxStars=2000&minGoodFirstIssues=3&pushedWithinDays=30
@@ -74,11 +76,22 @@ public class ApiController {
             @RequestParam(defaultValue = "0") Integer pushedWithinDays,
             @RequestParam(required = false) String license,
             @RequestParam(defaultValue = "true") boolean excludeForks,
+            @RequestParam(required = false) @Size(max = 120) String keyword,
             @RequestParam(defaultValue = "stars") String sort,
             @RequestParam(defaultValue = "desc") String order) {
         return repos.search(new RepoFilters(topics, language, minStars, maxStars,
                 minGoodFirstIssues, minHelpWantedIssues, pushedWithinDays, license,
-                excludeForks, sort, order));
+                excludeForks, keyword, sort, order));
+    }
+
+    /**
+     * GET /api/repo/{owner}/{repo}
+     * Repo detail for an expanded issue card (stars, forks, license, description...).
+     */
+    @GetMapping("/repo/{owner}/{repo}")
+    public Map<String, Object> repoDetail(@PathVariable @Pattern(regexp = SLUG) String owner,
+                                          @PathVariable @Pattern(regexp = SLUG) String repo) {
+        return repos.detail(owner, repo);
     }
 
     /**
@@ -86,7 +99,8 @@ public class ApiController {
      * The differentiator: maintainer responsiveness score from recent PR history.
      */
     @GetMapping("/health/{owner}/{repo}")
-    public Map<String, Object> repoHealth(@PathVariable String owner, @PathVariable String repo) {
+    public Map<String, Object> repoHealth(@PathVariable @Pattern(regexp = SLUG) String owner,
+                                          @PathVariable @Pattern(regexp = SLUG) String repo) {
         return health.score(owner, repo);
     }
 }
